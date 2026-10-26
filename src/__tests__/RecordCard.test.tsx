@@ -1,8 +1,15 @@
 import React from 'react';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import RecordCard from '@/components/records/RecordCard';
-import { MedicalRecord } from '@/types';
+import { type MedicalRecord } from '@/types';
 import { shareRecord } from '@/services/api.service';
+import { Keypair } from '@stellar/stellar-sdk';
+import { addContact, emptyAddressBook } from '@/lib/addressBook';
+import { createEncryptedLocalStore, createMemoryKeyProvider } from '@/lib/encryptedLocalStore';
+import { useAddressBookStore } from '@/store/addressBookStore';
+import { useWalletStore } from '@/store/useWalletStore';
+import type { AddressBook } from '@/types';
 import {
   createSorobanMockHandlers,
   LedgerStateMachine,
@@ -20,6 +27,13 @@ jest.mock('@/hooks/useToast', () => ({
     toast: jest.fn(),
   }),
 }));
+
+const renderRecordCard = (record: MedicalRecord) =>
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <RecordCard record={record} />
+    </QueryClientProvider>,
+  );
 
 const mockRecord: MedicalRecord = {
   id: 'rec1',
@@ -69,32 +83,58 @@ describe('RecordCard component', () => {
     expect(screen.getByText('Lisinopril 10mg')).toBeInTheDocument();
   });
 
-  it('handles sharing record flow successfully', async () => {
-    const mockPrompt = jest.spyOn(window, 'prompt').mockReturnValue('GPROVIDER456');
+  it('shares a record with a provider entered by address', async () => {
     const mockShareResponse = {
       token: 'ST-ABC123XYZ',
       expiresAt: '2026-07-29T12:00:00.000Z',
-      providerAddress: 'GPROVIDER456',
+      providerAddress: PROVIDER,
     };
     (shareRecord as jest.Mock).mockResolvedValue(mockShareResponse);
 
-    render(<RecordCard record={mockRecord} />);
+    renderRecordCard(mockRecord);
 
-    const shareButton = screen.getByRole('button', { name: /share/i });
-    fireEvent.click(shareButton);
+    fireEvent.click(screen.getByRole('button', { name: /^share$/i }));
+    fireEvent.change(screen.getByLabelText('Provider Stellar address'), {
+      target: { value: PROVIDER },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /generate token/i }));
 
     expect(screen.getByRole('button', { name: /sharing…/i })).toBeDisabled();
-
-    expect(mockPrompt).toHaveBeenCalledWith('Enter provider Stellar address:');
-    expect(shareRecord).toHaveBeenCalledWith('rec1', 'GPROVIDER456');
+    expect(shareRecord).toHaveBeenCalledWith('rec1', PROVIDER);
 
     await waitFor(() => {
       expect(screen.getByText(/Token:/)).toBeInTheDocument();
       expect(screen.getByText('ST-ABC123XYZ')).toBeInTheDocument();
       expect(screen.getByText(/Expires:/)).toBeInTheDocument();
     });
+  });
 
-    mockPrompt.mockRestore();
+  it('resolves a trusted contact name to its address when sharing', async () => {
+    const storage = createEncryptedLocalStore<AddressBook>({
+      namespace: 'heliora-address-book',
+      keyProvider: createMemoryKeyProvider(),
+    });
+    await storage.save(OWNER, addContact(emptyAddressBook(), { publicKey: PROVIDER, alias: 'Dr. Sarah' }).book);
+    useAddressBookStore.setState({ storage });
+    useAddressBookStore.getState().reset();
+    useWalletStore.setState({ publicKey: OWNER });
+    (shareRecord as jest.Mock).mockResolvedValue({
+      token: 'ST-1',
+      expiresAt: '2026-07-29T12:00:00.000Z',
+      providerAddress: PROVIDER,
+    });
+
+    renderRecordCard(mockRecord);
+    fireEvent.click(screen.getByRole('button', { name: /^share$/i }));
+    fireEvent.change(screen.getByLabelText('Provider Stellar address'), {
+      target: { value: 'Dr. Sarah' },
+    });
+    await screen.findByText(/unverified contact/);
+    fireEvent.click(screen.getByRole('button', { name: /generate token/i }));
+
+    expect(shareRecord).toHaveBeenCalledWith('rec1', PROVIDER);
+    expect(await screen.findByText(/Shared with/)).toHaveTextContent('Shared with Dr. Sarah');
+    useWalletStore.setState({ publicKey: null });
   });
 });
 
@@ -149,7 +189,7 @@ describe('Soroban mock harness integration', () => {
     ledger.set('record:2', { diagnosis: 'Cold' });
     const entries = ledger.resolve(['record:1', 'record:2', 'record:missing']);
     expect(entries).toHaveLength(2);
-    expect(entries[0].val).toEqual({ diagnosis: 'Flu' });
-    expect(entries[1].val).toEqual({ diagnosis: 'Cold' });
+    expect(entries[0]!.val).toEqual({ diagnosis: 'Flu' });
+    expect(entries[1]!.val).toEqual({ diagnosis: 'Cold' });
   });
 });
